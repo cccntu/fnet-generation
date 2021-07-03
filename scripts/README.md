@@ -1,4 +1,12 @@
 
+```
+pip install --upgrade pip
+pip install torch==1.9.0+cpu torchvision==0.10.0+cpu torchaudio==0.9.0 -f https://download.pytorch.org/whl/torch_stable.html
+pip install "jax[tpu]>=0.2.16" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install -r requirements.txt
+git clone https://huggingface.co/flax-community/hybrid-fnet-test
+export MODEL_DIR=hybrid-fnet-test
+```
 * save bert config and tokenizer in MODEL_DIR
 * then run: (using a small dataset as test)
 ```

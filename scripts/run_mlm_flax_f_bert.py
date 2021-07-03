@@ -41,9 +41,6 @@ import optax
 from flax import jax_utils, traverse_util
 from flax.training import train_state
 from flax.training.common_utils import get_metrics, onehot, shard
-from transformers.models.f_bert.modeling_flax_bert import FlaxBertForMaskedLM
-from transformers.models.f_bert.configuration_bert import BertConfig
-from transformers.models.f_bert.tokenization_bert import BertTokenizer
 from transformers import (
     CONFIG_MAPPING,
     FLAX_MODEL_FOR_MASKED_LM_MAPPING,
@@ -114,6 +111,10 @@ class ModelArguments:
         metadata={
             "help": "Floating-point format in which the model weights should be initialized and trained. Choose one of `[float32, float16, bfloat16]`."
         },
+    )
+    fbert: bool = field(
+        default=True,
+        metadata={"help": "Whether to use fbert"},
     )
 
 
@@ -297,6 +298,14 @@ if __name__ == "__main__":
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if model_args.fbert:
+        from transformers.models.f_bert.modeling_flax_bert import FlaxBertForMaskedLM
+        from transformers.models.f_bert.configuration_bert import BertConfig
+        from transformers.models.f_bert.tokenization_bert import BertTokenizer
+    else:
+        from transformers.models.bert.modeling_flax_bert import FlaxBertForMaskedLM
+        from transformers.models.bert.configuration_bert import BertConfig
+        from transformers.models.bert.tokenization_bert import BertTokenizer
 
     if (
         os.path.exists(training_args.output_dir)
@@ -325,6 +334,7 @@ if __name__ == "__main__":
 
     # Set the verbosity to info of the Transformers logger (on main process only):
     logger.info(f"Training/evaluation parameters {training_args}")
+    logger.info(f"using fbert {model_args.fbert}")
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
