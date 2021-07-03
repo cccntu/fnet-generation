@@ -1,3 +1,6 @@
+```
+git submodule update --init --recursive
+```
 
 ```
 pip install --upgrade pip
