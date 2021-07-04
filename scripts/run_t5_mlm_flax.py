@@ -53,6 +53,7 @@ from transformers import (
     set_seed,
 )
 from transformers.models.t5.modeling_flax_t5 import shift_tokens_right
+import wandb
 
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
@@ -391,7 +392,6 @@ def generate_batch_splits(samples_idx: jnp.ndarray, batch_size: int) -> jnp.ndar
 def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
     summary_writer.scalar("train_time", train_time, step)
 
-    train_metrics = get_metrics(train_metrics)
     for key, vals in train_metrics.items():
         tag = f"train_{key}"
         for i, val in enumerate(vals):
@@ -402,6 +402,7 @@ def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
 
 
 if __name__ == "__main__":
+    _ = np.array(jnp.array([1.0], dtype=jnp.float16))
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
@@ -595,6 +596,8 @@ if __name__ == "__main__":
     dropout_rngs = jax.random.split(rng, jax.local_device_count())
 
     model = FlaxT5ForConditionalGeneration(config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype))
+    dtype = getattr(jnp, model_args.dtype)
+    model.params = jax.tree_map(lambda x: x.astype(dtype), model.params)
 
     # Data collator
     # This one will take care of randomly masking the tokens.
@@ -667,6 +670,7 @@ if __name__ == "__main__":
             labels = batch.pop("labels")
 
             logits = state.apply_fn(**batch, params=params, dropout_rng=dropout_rng, train=True)[0]
+            print(f"{logits.dtype=}")
 
             # compute loss
             loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1])).mean()
@@ -675,6 +679,10 @@ if __name__ == "__main__":
 
         grad_fn = jax.value_and_grad(loss_fn)
         loss, grad = grad_fn(state.params)
+        dtype = getattr(jnp, model_args.dtype)
+        if model_args.dtype != "float32":
+            grad = jax.tree_map(lambda x: x.astype(dtype), grad)
+
         grad = jax.lax.pmean(grad, "batch")
         new_state = state.apply_gradients(grads=grad)
 
@@ -710,40 +718,27 @@ if __name__ == "__main__":
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
 
-    train_time = 0
-    epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
-    for epoch in epochs:
-        # ======================== Training ================================
-        train_start = time.time()
-        train_metrics = []
+    def get_training_steps_generator(rng):
+        epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0) 
+        step = 0
+        for epoch in epochs:
+            # Create sampling rng
+            rng, input_rng = jax.random.split(rng)
+            # Generate an epoch by shuffling sampling indices from the train dataset
+            num_train_samples = len(tokenized_datasets["train"])
+            train_samples_idx = jax.random.permutation(input_rng, jnp.arange(num_train_samples))
+            train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
+            epoch_size = len(train_batch_idx)
+            for i, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
+                samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
+                model_inputs = data_collator(samples)
+                step += 1
+                yield {
+                    'step': step,
+                    'epoch': epoch + i/epoch_size,
+                }, model_inputs
 
-        # Create sampling rng
-        rng, input_rng = jax.random.split(rng)
-
-        # Generate an epoch by shuffling sampling indices from the train dataset
-        num_train_samples = len(tokenized_datasets["train"])
-        train_samples_idx = jax.random.permutation(input_rng, jnp.arange(num_train_samples))
-        train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
-
-        # Gather the indexes for creating the batch and do a training step
-        for i, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
-            samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
-            model_inputs = data_collator(samples)
-            if i == 0:
-                print({k:v.shape for k,v in model_inputs.items()})
-
-            # Model forward
-            model_inputs = shard(model_inputs.data)
-            state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
-            train_metrics.append(train_metric)
-
-        train_time += time.time() - train_start
-
-        epochs.write(
-            f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss'].mean()}, Learning Rate: {train_metric['learning_rate'].mean()})"
-        )
-
-        # ======================== Evaluating ==============================
+    def evaluate():
         num_eval_samples = len(tokenized_datasets["validation"])
         eval_samples_idx = jnp.arange(num_eval_samples)
         eval_batch_idx = generate_batch_splits(eval_samples_idx, eval_batch_size)
@@ -761,18 +756,42 @@ if __name__ == "__main__":
         # get eval metrics
         eval_metrics = get_metrics(eval_metrics)
         eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+        return eval_metrics
 
-        # Update progress bar
-        epochs.write(
-            f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {eval_metrics['loss']}, Acc: {eval_metrics['accuracy']})"
-        )
 
-        # Save metrics
-        if has_tensorboard and jax.process_index() == 0:
-            cur_step = epoch * (len(tokenized_datasets["train"]) // train_batch_size)
-            write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
+    if jax.process_index() == 0:
+        wandb.init(project='fnet-generation', config={'model_args':model_args, 'data_args':data_args, 'training_args':training_args})
 
-        # save checkpoint after each epoch and push checkpoint to the hub
+    training_steps_generator = get_training_steps_generator(rng)
+    train_start = time.time()
+    train_metrics = []
+    for info, model_inputs in training_steps_generator:
+        # Model forward
+        model_inputs = shard(model_inputs.data)
+        state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
         if jax.process_index() == 0:
-            params = jax.device_get(jax.tree_map(lambda x: x[0], state.params))
-            model.save_pretrained(training_args.output_dir, params=params, push_to_hub=training_args.push_to_hub)
+            print(train_metric)
+            train_metrics = get_metrics(train_metrics)
+            train_metrics.append(train_metric)
+            wandb.log({'info':info, 'train':train_metric})
+
+        if info['step'] % 16384 == 0:
+            train_time += time.time() - train_start
+
+            epochs.write(
+                f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss'].mean()}, Learning Rate: {train_metric['learning_rate'].mean()})"
+            )
+
+            # ======================== Evaluating ==============================
+            eval_metrics = evaluate()
+            if jax.process_index() == 0:
+                wandb.log({'info':info, 'eval':eval_metrics})
+                # Save metrics
+                if has_tensorboard:
+                    cur_step = info['step']
+                    write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
+                # save checkpoint after each epoch and push checkpoint to the hub
+                params = jax.device_get(jax.tree_map(lambda x: x[0], state.params))
+                model.save_pretrained(training_args.output_dir, params=params, push_to_hub=training_args.push_to_hub)
+            train_start = time.time()
+            train_metrics = []
