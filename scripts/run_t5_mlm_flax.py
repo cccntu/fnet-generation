@@ -275,6 +275,12 @@ class FlaxDataCollatorForT5MLM:
         batch["decoder_input_ids"] = shift_tokens_right(
             batch["labels"], self.pad_token_id, self.decoder_start_token_id
         )
+        bsz, length = batch["decoder_input_ids"].shape
+        to_pad = 128-(length%128)
+        batch["decoder_input_ids"] = np.pad(batch["decoder_input_ids"], [[0,0],[0, to_pad]])
+        batch["labels"] = np.pad(batch["labels"], [[0,0],[0, to_pad]])
+        batch["decoder_attention_mask"] = np.ones((bsz,length))
+        batch["decoder_attention_mask"] = np.pad(batch["decoder_attention_mask"], [[0,0],[0, to_pad]])
 
         return batch
 
@@ -535,6 +541,7 @@ if __name__ == "__main__":
         noise_density=data_args.mlm_probability,
         mean_noise_span_length=data_args.mean_noise_span_length,
     )
+    print(f'{expanded_inputs_length=}, {targets_length=}')
 
     # Main data processing function that will concatenate all texts from our dataset and generate chunks of expanded_inputs_length.
     def group_texts(examples):
@@ -714,6 +721,8 @@ if __name__ == "__main__":
         for i, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
             samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
             model_inputs = data_collator(samples)
+            if i == 0:
+                print({k:v.shape for k,v in model_inputs.items()})
 
             # Model forward
             model_inputs = shard(model_inputs.data)
