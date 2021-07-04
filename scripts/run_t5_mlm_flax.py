@@ -403,7 +403,7 @@ def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
 
 
 if __name__ == "__main__":
-    _ = np.array(jnp.array([1.0], dtype=getattr(jnp, model_args.dtype)))
+    # _ = np.array(jnp.array([1.0], dtype=getattr(jnp, model_args.dtype)))
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
