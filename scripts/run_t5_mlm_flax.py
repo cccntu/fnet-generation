@@ -403,7 +403,7 @@ def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
 
 
 if __name__ == "__main__":
-    _ = np.array(jnp.array([1.0], dtype=jnp.float16))
+    _ = np.array(jnp.array([1.0], dtype=getattr(jnp, model_args.dtype)))
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
@@ -597,8 +597,8 @@ if __name__ == "__main__":
     dropout_rngs = jax.random.split(rng, jax.local_device_count())
 
     model = FlaxT5ForConditionalGeneration(config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype))
-    dtype = getattr(jnp, model_args.dtype)
-    model.params = jax.tree_map(lambda x: x.astype(dtype), model.params)
+    #dtype = getattr(jnp, model_args.dtype)
+    #model.params = jax.tree_map(lambda x: x.astype(dtype), model.params)
 
     # Data collator
     # This one will take care of randomly masking the tokens.
@@ -682,9 +682,9 @@ if __name__ == "__main__":
 
         grad_fn = jax.value_and_grad(loss_fn)
         loss, grad = grad_fn(state.params)
-        dtype = getattr(jnp, model_args.dtype)
-        if model_args.dtype != "float32":
-            grad = jax.tree_map(lambda x: x.astype(dtype), grad)
+        #dtype = getattr(jnp, model_args.dtype)
+        #if model_args.dtype != "float32":
+        #    grad = jax.tree_map(lambda x: x.astype(dtype), grad)
 
         grad = jax.lax.pmean(grad, "batch")
         new_state = state.apply_gradients(grads=grad)
@@ -776,7 +776,6 @@ if __name__ == "__main__":
         if jax.process_index() == 0:
             device_metrics = jax.tree_map(lambda x: x[0], train_metric)
             metrics_np = jax.device_get(device_metrics)
-            print(metrics_np)
             wandb.log({'info':info, 'train':metrics_np})
 
         if info['step'] % 16384 == 0:
