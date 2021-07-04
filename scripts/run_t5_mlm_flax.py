@@ -542,6 +542,7 @@ if __name__ == "__main__":
         mean_noise_span_length=data_args.mean_noise_span_length,
     )
     print(f'{expanded_inputs_length=}, {targets_length=}')
+    print(f"{training_args.adafactor=}")
 
     # Main data processing function that will concatenate all texts from our dataset and generate chunks of expanded_inputs_length.
     def group_texts(examples):
@@ -639,17 +640,24 @@ if __name__ == "__main__":
         }
         return traverse_util.unflatten_dict(flat_mask)
 
-    # create adam optimizer
-    adamw = optax.adamw(
-        learning_rate=linear_decay_lr_schedule_fn,
-        b1=training_args.adam_beta1,
-        b2=training_args.adam_beta2,
-        weight_decay=training_args.weight_decay,
-        mask=decay_mask_fn,
-    )
+    # create optimizer
+    if training_args.adafactor:
+        print(f"using adafactor optimizer")
+        tx = optax.adafactor(
+            learning_rate=linear_decay_lr_schedule_fn,
+        )
+    else:
+        tx = optax.adamw(
+            learning_rate=linear_decay_lr_schedule_fn,
+            b1=training_args.adam_beta1,
+            b2=training_args.adam_beta2,
+            weight_decay=training_args.weight_decay,
+            mask=decay_mask_fn,
+        )
+
 
     # Setup train state
-    state = train_state.TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw)
+    state = train_state.TrainState.create(apply_fn=model.__call__, params=model.params, tx=tx)
 
     # Define gradient update step fn
     def train_step(state, batch, dropout_rng):
