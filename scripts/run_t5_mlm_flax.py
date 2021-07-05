@@ -783,6 +783,7 @@ if __name__ == "__main__":
     train_start = time.time()
     train_time=0
     train_metrics = []
+    train_metrics_on_device = []
     for info, model_inputs in training_steps_generator:
         # Model forward
         timer.start('shard')
@@ -797,13 +798,19 @@ if __name__ == "__main__":
         timer.start('p_train_step')
         state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
         timer.start('log train')
-        train_metric = device_get_one_shard(train_metric)
-        train_metrics.append(train_metric)
         if jax.process_index() == 0:
-            wandb.log({'info':info, 'train':train_metric})
+            train_metrics_on_device.append(train_metric)
+            if info['step'] % training_args.logging_steps == 0:
+                train_metrics_host = device_get_one_shard(train_metrics_on_device)
+                train_metrics_on_device = []
+                train_metrics.extend(train_metrics_host)
+                for train_metric in train_metrics_host:
+                    wandb.log({'info':info, 'train':train_metric})
         timer.start('other')
         if info['step'] == 100:
-            print(timer.summary())
+            summary = timer.summary()
+            print(summary)
+            wandb.log({'summary':summary})
             sys.exit()
 
 

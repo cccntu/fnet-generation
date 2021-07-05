@@ -25,4 +25,4 @@ class Timer:
             self._stop(self.last_key)
             self.last_key = None
     def summary(self):
-        return self.total
+        return dict(self.total)
