@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -392,7 +392,7 @@ def generate_batch_splits(samples_idx: jnp.ndarray, batch_size: int) -> jnp.ndar
 def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
     summary_writer.scalar("train_time", train_time, step)
 
-    train_metrics = get_metrics(train_metrics)
+    train_metrics = jax.tree_multimap(lambda *args: np.stack(args), *train_metrics)
     for key, vals in train_metrics.items():
         tag = f"train_{key}"
         for i, val in enumerate(vals):
@@ -401,6 +401,11 @@ def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
     for metric_name, value in eval_metrics.items():
         summary_writer.scalar(f"eval_{metric_name}", value, step)
 
+def device_get_one_shard(device_shards):
+    """get_metrics, but for only one dictionary"""
+    firsts = jax.tree_map(lambda x: x[0], device_shards)
+    host_copy = jax.device_get(firsts)
+    return host_copy
 
 if __name__ == "__main__":
     # _ = np.array(jnp.array([1.0], dtype=getattr(jnp, model_args.dtype)))
@@ -701,17 +706,20 @@ if __name__ == "__main__":
     # Define eval fn
     def eval_step(params, batch):
         labels = batch.pop("labels")
+        label_mask = batch.pop("label_mask")
 
         logits = model(**batch, params=params, train=False)[0]
 
         # compute loss
         loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
+        loss = (loss * label_mask).sum() / label_mask.sum()
 
         # compute accuracy
         accuracy = jnp.equal(jnp.argmax(logits, axis=-1), labels)
+        accuracy = (accuracy * label_mask).sum() / label_mask.sum()
 
         # summarize metrics
-        metrics = {"loss": loss.mean(), "accuracy": accuracy.mean()}
+        metrics = {"loss": loss, "accuracy": accuracy}
         metrics = jax.lax.pmean(metrics, axis_name="batch")
 
         return metrics
@@ -763,32 +771,35 @@ if __name__ == "__main__":
 
 
     if jax.process_index() == 0:
-        wandb.init(project='fnet-generation', config={'model_args':model_args, 'data_args':data_args, 'training_args':training_args})
+        wandb.init(project='fnet-generation', config={'model_args':asdict(model_args),
+        'data_args':asdict(data_args),
+        'training_args':asdict(training_args)})
          
     training_steps_generator = get_training_steps_generator(rng)
     train_start = time.time()
+    train_time=0
     train_metrics = []
     for info, model_inputs in training_steps_generator:
         # Model forward
         model_inputs = shard(model_inputs.data)
         state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
+        train_metric = device_get_one_shard(train_metric)
         train_metrics.append(train_metric)
         if jax.process_index() == 0:
-            device_metrics = jax.tree_map(lambda x: x[0], train_metric)
-            metrics_np = jax.device_get(device_metrics)
-            wandb.log({'info':info, 'train':metrics_np})
+            wandb.log({'info':info, 'train':train_metric})
 
-        if info['step'] % 16384 == 0:
+        if info['step'] % training_args.eval_steps == 0:
             train_time += time.time() - train_start
 
-            epochs.write(
-                f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss'].mean()}, Learning Rate: {train_metric['learning_rate'].mean()})"
-            )
+            # update prograss
+            #epochs.write(
+            #    f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss'].mean()}, Learning Rate: {train_metric['learning_rate'].mean()})"
+            #)
 
             # ======================== Evaluating ==============================
             eval_metrics = evaluate()
             if jax.process_index() == 0:
-                wandb.log({'info':info, 'eval':eval_metrics})
+                wandb.log({'info':info, 'eval':jax.device_get(eval_metrics)})
                 # Save metrics
                 if has_tensorboard:
                     cur_step = info['step']
