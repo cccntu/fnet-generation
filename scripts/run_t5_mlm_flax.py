@@ -743,7 +743,8 @@ if __name__ == "__main__":
             for i, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
                 samples = tokenized_datasets["train"].select(batch_idx)
                 #samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
-                model_inputs = data_collator(samples)
+                #model_inputs = data_collator(samples)
+                model_inputs = {}
                 step += 1
                 yield {
                     'step': step,
