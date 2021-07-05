@@ -278,10 +278,10 @@ class FlaxDataCollatorForT5MLM:
         )
         bsz, length = batch["decoder_input_ids"].shape
         to_pad = 128-(length%128)
-        batch["decoder_input_ids"] = np.pad(batch["decoder_input_ids"], [[0,0],[0, to_pad]])
-        batch["labels"] = np.pad(batch["labels"], [[0,0],[0, to_pad]])
-        batch["label_mask"] = np.pad(np.ones((bsz,length)), [[0,0],[0, to_pad]])
-        batch["decoder_attention_mask"] = np.pad(np.ones((bsz,length)), [[0,0],[0, to_pad]])
+        #batch["decoder_input_ids"] = np.pad(batch["decoder_input_ids"], [[0,0],[0, to_pad]])
+        #batch["labels"] = np.pad(batch["labels"], [[0,0],[0, to_pad]])
+        #batch["label_mask"] = np.pad(np.ones((bsz,length)), [[0,0],[0, to_pad]])
+        #batch["decoder_attention_mask"] = np.pad(np.ones((bsz,length)), [[0,0],[0, to_pad]])
 
         return batch
 
@@ -674,14 +674,15 @@ if __name__ == "__main__":
 
         def loss_fn(params):
             labels = batch.pop("labels")
-            label_mask = batch.pop("label_mask")
+            #label_mask = batch.pop("label_mask")
 
             logits = state.apply_fn(**batch, params=params, dropout_rng=dropout_rng, train=True)[0]
             print(f"{logits.dtype=}")
 
             # compute loss
             loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
-            loss = (loss * label_mask).sum() / label_mask.sum()
+            loss = loss.mean()
+            #loss = (loss * label_mask).sum() / label_mask.sum()
 
             return loss
 
@@ -706,17 +707,19 @@ if __name__ == "__main__":
     # Define eval fn
     def eval_step(params, batch):
         labels = batch.pop("labels")
-        label_mask = batch.pop("label_mask")
+        #label_mask = batch.pop("label_mask")
 
         logits = model(**batch, params=params, train=False)[0]
 
         # compute loss
         loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
-        loss = (loss * label_mask).sum() / label_mask.sum()
+        loss = loss.mean()
+        #loss = (loss * label_mask).sum() / label_mask.sum()
 
         # compute accuracy
         accuracy = jnp.equal(jnp.argmax(logits, axis=-1), labels)
-        accuracy = (accuracy * label_mask).sum() / label_mask.sum()
+        accuracy = accuracy.mean()
+        #accuracy = (accuracy * label_mask).sum() / label_mask.sum()
 
         # summarize metrics
         metrics = {"loss": loss, "accuracy": accuracy}
