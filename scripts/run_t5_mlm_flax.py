@@ -809,7 +809,7 @@ if __name__ == "__main__":
                 for train_metric in train_metrics_host:
                     wandb.log({'info':info, 'train':train_metric})
         timer.start('other')
-        if info['step'] == 2:
+        if info['step'] == 10:
             jax.profiler.stop_trace()
         if info['step'] == 100:
 
