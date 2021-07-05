@@ -54,6 +54,7 @@ from transformers import (
 )
 from transformers.models.t5.modeling_flax_t5 import shift_tokens_right
 import wandb
+from utils import Timer
 
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
@@ -663,7 +664,7 @@ if __name__ == "__main__":
             weight_decay=training_args.weight_decay,
             mask=decay_mask_fn,
         )
-
+    timer = Timer(cond = lambda: jax.process_index() == 0)
 
     # Setup train state
     state = train_state.TrainState.create(apply_fn=model.__call__, params=model.params, tx=tx)
@@ -729,7 +730,7 @@ if __name__ == "__main__":
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
 
-    def get_training_steps_generator(rng):
+    def get_training_steps_generator(rng, timer):
         epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0) 
         step = 0
         for epoch in epochs:
@@ -741,10 +742,11 @@ if __name__ == "__main__":
             train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
             epoch_size = len(train_batch_idx)
             for i, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
+                timer.start('select')
                 samples = tokenized_datasets["train"].select(batch_idx)
+                timer.start('collate')
                 #samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
-                #model_inputs = data_collator(samples)
-                model_inputs = {}
+                model_inputs = data_collator(samples)
                 step += 1
                 yield {
                     'step': step,
@@ -777,24 +779,33 @@ if __name__ == "__main__":
         'data_args':asdict(data_args),
         'training_args':asdict(training_args)})
          
-    training_steps_generator = get_training_steps_generator(rng)
+    training_steps_generator = get_training_steps_generator(rng, timer)
     train_start = time.time()
     train_time=0
     train_metrics = []
     for info, model_inputs in training_steps_generator:
         # Model forward
-        # model_inputs = shard(model_inputs.data)
-        #if info['step'] == 1:
-        #    print(jax.tree_map(lambda x: x.shape, model_inputs))
-        #    print(jax.tree_map(lambda x: type(x), model_inputs))
-        if jax.process_index() == 0:
-            wandb.log({'info':info})
-        continue
+        timer.start('shard')
+        model_inputs = shard(model_inputs.data)
+        timer.start('print')
+        if info['step'] == 1:
+            print(jax.tree_map(lambda x: x.shape, model_inputs))
+            print(jax.tree_map(lambda x: type(x), model_inputs))
+        #if jax.process_index() == 0:
+        #    wandb.log({'info':info})
+        #continue
+        timer.start('p_train_step')
         state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
+        timer.start('log train')
         train_metric = device_get_one_shard(train_metric)
         train_metrics.append(train_metric)
         if jax.process_index() == 0:
             wandb.log({'info':info, 'train':train_metric})
+        timer.start('other')
+        if info['step'] == 100:
+            print(timer.summary())
+            sys.exit()
+
 
         if info['step'] % training_args.eval_steps == 0:
             train_time += time.time() - train_start
