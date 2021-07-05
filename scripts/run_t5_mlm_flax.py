@@ -741,7 +741,8 @@ if __name__ == "__main__":
             train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
             epoch_size = len(train_batch_idx)
             for i, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
-                samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
+                samples = tokenized_datasets["train"].select(batch_idx)
+                #samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
                 model_inputs = data_collator(samples)
                 step += 1
                 yield {
