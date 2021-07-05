@@ -782,10 +782,10 @@ if __name__ == "__main__":
     train_metrics = []
     for info, model_inputs in training_steps_generator:
         # Model forward
-        model_inputs = shard(model_inputs.data)
-        if info['step'] == 1:
-            print(jax.tree_map(lambda x: x.shape, model_inputs))
-            print(jax.tree_map(lambda x: type(x), model_inputs))
+        # model_inputs = shard(model_inputs.data)
+        #if info['step'] == 1:
+        #    print(jax.tree_map(lambda x: x.shape, model_inputs))
+        #    print(jax.tree_map(lambda x: type(x), model_inputs))
         if jax.process_index() == 0:
             wandb.log({'info':info})
         continue
