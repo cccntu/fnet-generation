@@ -704,6 +704,12 @@ if __name__ == "__main__":
     # Create parallel version of the train step
     p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0,))
 
+    @jax.jit
+    def p_train_step_metric_to_cpu(state, model_inputs, dropout_rngs):
+        state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
+        train_metric = device_get_one_shard(train_metric)
+        return state, train_metric, dropout_rngs
+
     # Define eval fn
     def eval_step(params, batch):
         labels = batch.pop("labels")
@@ -795,9 +801,9 @@ if __name__ == "__main__":
         #    wandb.log({'info':info})
         #continue
         timer.start('p_train_step')
-        state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
+        state, train_metric, dropout_rngs = p_train_step_metric_to_cpu(state, model_inputs, dropout_rngs)
         timer.start('log train')
-        train_metric = device_get_one_shard(train_metric)
+        #train_metric = device_get_one_shard(train_metric)
         train_metrics.append(train_metric)
         if jax.process_index() == 0:
             wandb.log({'info':info, 'train':train_metric})
