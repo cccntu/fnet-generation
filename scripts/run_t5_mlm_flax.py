@@ -57,6 +57,7 @@ import wandb
 from utils import Timer
 
 
+
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
@@ -741,6 +742,7 @@ if __name__ == "__main__":
             train_samples_idx = jax.random.permutation(input_rng, jnp.arange(num_train_samples))
             train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
             epoch_size = len(train_batch_idx)
+            jax.profiler.start_trace("/tmp/tensorboard")
             for i, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
                 timer.start('select')
                 samples = tokenized_datasets["train"].select(batch_idx)
@@ -807,7 +809,10 @@ if __name__ == "__main__":
                 for train_metric in train_metrics_host:
                     wandb.log({'info':info, 'train':train_metric})
         timer.start('other')
+        if info['step'] == 2:
+            jax.profiler.stop_trace()
         if info['step'] == 100:
+
             summary = timer.summary()
             print(summary)
             wandb.log({'summary':summary})
