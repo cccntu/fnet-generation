@@ -744,10 +744,12 @@ if __name__ == "__main__":
                 samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
                 model_inputs = data_collator(samples)
                 step += 1
-                yield {
-                    'step': step,
-                    'epoch': epoch + i/epoch_size,
-                }, model_inputs
+                for i in range(100000):
+                    yield {
+                        'step': step,
+                        'epoch': epoch + i/epoch_size,
+                    }, model_inputs
+                    step += 1
 
     def evaluate():
         num_eval_samples = len(tokenized_datasets["validation"])
