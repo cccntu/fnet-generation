@@ -857,9 +857,10 @@ if __name__ == "__main__":
     train_metrics = []
     for info, model_inputs in training_steps_generator:
         # Model forward
-        if info['step'] == 1:
-            print(jax.tree_map(lambda x:(type(x), x.shape), model_inputs))
         model_inputs = shard(model_inputs)
+        if info['step'] == 1:
+            print('first step:')
+            print(jax.tree_map(lambda x:(type(x), x.shape), model_inputs))
         state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
         train_metric = device_get_one_shard(train_metric)
         train_metrics.append(train_metric)
