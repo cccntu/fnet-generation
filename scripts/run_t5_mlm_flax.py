@@ -60,6 +60,7 @@ import wandb
 CPU_COUNT = len(os.sched_getaffinity(0))
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+JAX_CPU = jax.devices("cpu")[0]
 
 # numpy version, to work with pytorch multi worker dataloader
 def shift_tokens_right(input_ids: np.ndarray, pad_token_id: int, decoder_start_token_id: int) -> np.ndarray:
@@ -697,7 +698,11 @@ if __name__ == "__main__":
     model = FlaxT5ForConditionalGeneration(config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype))
 
 
-    num_train_steps = len(tokenized_datasets["train"]) // train_batch_size * num_epochs
+    epoch_size = len(tokenized_datasets["train"]) // train_batch_size
+    num_train_steps = epoch_size * num_epochs
+    if 0 < training_args.max_steps < num_train_steps:
+        print(f'Will stop at {training_args.max_steps} steps.')
+        num_train_steps = training_args.max_steps
 
     # Create learning rate schedule
     warmup_fn = optax.linear_schedule(
@@ -805,8 +810,7 @@ if __name__ == "__main__":
 
 
     def jax_random_batch_sampler(rng, num_samples, batch_size):
-        cpu = jax.devices("cpu")[0]
-        rng = jax.device_put(rng, cpu)
+        rng = jax.device_put(rng, JAX_CPU)
         # loop forever, modify this for epoch-as-unit style. Or control it outside
         while True:
             rng, input_rng = jax.random.split(rng)
@@ -819,21 +823,14 @@ if __name__ == "__main__":
                 ids = train_samples_idx[i*batch_size: (i+1)*batch_size].tolist()
                 yield ids
     def get_training_steps_generator(rng):
-        num_samples = len(tokenized_datasets["train"])
-        batch_size = train_batch_size
-        #batch_sampler = jax_random_batch_sampler(rng, num_samples, batch_size)
-        #train_dl = DataLoader(train_set, batch_size=batch_size, collate_fn=data_collator, num_workers=CPU_COUNT)
-        #train_dl = DataLoader(train_set, batch_sampler=batch_sampler, num_workers=CPU_COUNT, collate_fn=data_collator)
-        step = 0
-        epoch_size = num_samples//batch_size
-        # only loop for fixed number of epoch
-        #epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
-        # for epoch in range(num_epochs):
-        for step, batch in enumerate(tqdm(train_dl)):
-            yield {
-                'step': step+1,
-                'epoch': (step+1)/epoch_size,
-            }, batch
+        step = 1
+        while True:
+            for batch in tqdm(train_dl):
+                yield {
+                    'step': step,
+                    'epoch': step/epoch_size,
+                }, batch
+                step += 1
     def evaluate():
         num_eval_samples = len(tokenized_datasets["validation"])
         eval_samples_idx = jnp.arange(num_eval_samples)
@@ -856,11 +853,18 @@ if __name__ == "__main__":
         wandb.init(project='fnet-generation', config={'model_args':asdict(model_args),
         'data_args':asdict(data_args),
         'training_args':asdict(training_args)})
+    def first_shard(tree):
+        return jax.tree_map(lambda x: x[0], tree)
+    def to_cpu_device(device_array):
+        return jax.device_put(device_array, JAX_CPU) # return DeviceArray, hopufully non-blocking
+
+
          
     training_steps_generator = get_training_steps_generator(rng)
     train_start = time.time()
     train_time=0
     train_metrics = []
+    log_buffer = [] # don't log every step
     for info, model_inputs in training_steps_generator:
         # Model forward
         model_inputs = shard(model_inputs)
@@ -868,20 +872,19 @@ if __name__ == "__main__":
             print('first step:')
             print(jax.tree_map(lambda x:(type(x), x.shape), model_inputs))
         state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
-        train_metric = device_get_one_shard(train_metric)
-        train_metrics.append(train_metric)
-        if jax.process_index() == 0:
-            wandb.log({'info':info, 'train':train_metric})
+        train_metric = to_cpu_device(first_shard(train_metric))
+        log_buffer.append({'info':info, 'train':train_metric})
+        if info['step'] % training_args.logging_steps == 0:
+            log_buffer = jax.device_get(log_buffer)
+            for log in log_buffer:
+                if jax.process_index() == 0:
+                    wandb.log(log)
+                    train_metrics.append(log['train'])
+            log_buffer = []
 
-        if info['step'] % training_args.eval_steps == 0:
+        # ======================== Evaluating ==============================
+        if info['step'] % training_args.eval_steps == 0 or info['step'] == num_train_steps:
             train_time += time.time() - train_start
-
-            # update prograss
-            #epochs.write(
-            #    f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss'].mean()}, Learning Rate: {train_metric['learning_rate'].mean()})"
-            #)
-
-            # ======================== Evaluating ==============================
             eval_metrics = evaluate()
             if jax.process_index() == 0:
                 wandb.log({'info':info, 'eval':jax.device_get(eval_metrics)})
@@ -894,3 +897,5 @@ if __name__ == "__main__":
                 model.save_pretrained(training_args.output_dir, params=params, push_to_hub=training_args.push_to_hub)
             train_start = time.time()
             train_metrics = []
+            if info['step'] == num_train_steps:
+                sys.exit()
