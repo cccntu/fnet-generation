@@ -229,7 +229,7 @@ class FlaxDataCollatorForT5MLM:
     def __call__(self, examples):
         ret = {k: np.concatenate([ex[k] for ex in examples]) for k in examples[0].keys()}
         return ret
-        
+
 
 #@flax.struct.dataclass
 @dataclass
@@ -415,7 +415,7 @@ class FlaxDatasetForT5MLM:
 
 
 def generate_batch_splits(samples_idx:np.ndarray, batch_size: int) -> np.ndarray:
-    """ 
+    """
     for large dataset, use np.ndarray to save device memory
     """
     num_samples = len(samples_idx)
@@ -859,7 +859,7 @@ if __name__ == "__main__":
         return jax.device_put(device_array, JAX_CPU) # return DeviceArray, hopufully non-blocking
 
 
-         
+
     training_steps_generator = get_training_steps_generator(rng)
     train_start = time.time()
     train_time=0
