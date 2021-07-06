@@ -54,13 +54,25 @@ from transformers import (
     is_tensorboard_available,
     set_seed,
 )
-from transformers.models.t5.modeling_flax_t5 import shift_tokens_right
+#from transformers.models.t5.modeling_flax_t5 import shift_tokens_right
 import wandb
 
 CPU_COUNT = len(os.sched_getaffinity(0))
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+# numpy version, to work with pytorch multi worker dataloader
+def shift_tokens_right(input_ids: np.ndarray, pad_token_id: int, decoder_start_token_id: int) -> np.ndarray:
+    """
+    Shift input ids one token to the right.
+    """
+    shifted_input_ids = np.roll(input_ids, 1, axis=-1)
+    #shifted_input_ids = jax.ops.index_update(shifted_input_ids, (..., 0), decoder_start_token_id)
+    shifted_input_ids[..., 0] = decoder_start_token_id
+    # replace possible -100 values in labels by `pad_token_id`
+    shifted_input_ids = np.where(shifted_input_ids == -100, pad_token_id, shifted_input_ids)
+
+    return shifted_input_ids
 
 @dataclass
 class ModelArguments:
@@ -257,7 +269,7 @@ class FlaxDatasetForT5MLM:
         return len(self.dataset)
     def __getitem__(self, i):
         example = self.dataset[i]
-        processed = self([example])
+        processed = self.__call__([example])
         return processed
 
     def __call__(self, examples: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
@@ -378,7 +390,7 @@ class FlaxDatasetForT5MLM:
             first_in_segment = np.pad(mask_indices, [[1, 0]])
             segment_id = np.cumsum(first_in_segment)
             #segment_sum = jax.jit(jax.ops.segment_sum,device =jax.devices('cpu')[0])
-            segment_sum = jax.ops.segment_sum
+            #segment_sum = jax.ops.segment_sum
             from collections import Counter
             cnt = Counter(segment_id.tolist())
             segment_length = np.array([cnt[x] for x in sorted(cnt.keys())])
@@ -626,7 +638,7 @@ if __name__ == "__main__":
 
     # Data collator
     # This one will take care of randomly masking the tokens.
-    data_collator = FlaxDataCollatorForT5MLM()
+    collate_fn = FlaxDataCollatorForT5MLM()
     train_set, val_set  = map(lambda split_name: FlaxDatasetForT5MLM(
         tokenizer=tokenizer,
         noise_density=data_args.mlm_probability,
@@ -645,10 +657,32 @@ if __name__ == "__main__":
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
 
     # dataloader
-    train_dl = DataLoader(train_set, batch_size=train_batch_size, collate_fn=data_collator, 
-    num_workers=CPU_COUNT,shuffle=True,drop_last=True)
+    # TODO: use jax deterministic random, but we already use np.random in dataset
+    #train_dl = DataLoader(train_set, batch_size=train_batch_size, collate_fn=data_collator, 
+    #num_workers=CPU_COUNT,shuffle=True,drop_last=True, persistent_workers=True)
+    train_dl = DataLoader(
+        train_set,
+        batch_size=train_batch_size,
+        shuffle=True,
+        num_workers=CPU_COUNT,
+        persistent_workers=True,
+        drop_last=True,
+        collate_fn=collate_fn,
+    )
 
-    print(jax.tree_map(lambda x:x.shape, next(iter(train_dl))))
+    val_dl = DataLoader(
+        val_set,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        num_workers=CPU_COUNT,
+        persistent_workers=True,
+        drop_last=True,
+        collate_fn=collate_fn,
+    )
+
+
+    print(next(iter(train_dl)))
+    #print(jax.tree_map(lambda x:x.shape, ))
 
     # Initialize our training
     rng = jax.random.PRNGKey(training_args.seed)
@@ -800,12 +834,9 @@ if __name__ == "__main__":
         eval_batch_idx = generate_batch_splits(eval_samples_idx, eval_batch_size)
 
         eval_metrics = []
-        for i, batch_idx in enumerate(tqdm(eval_batch_idx, desc="Evaluating ...", position=2)):
-            samples = [tokenized_datasets["validation"][int(idx)] for idx in batch_idx]
-            model_inputs = data_collator(samples)
-
+        for i, model_inputs in enumerate(tqdm(val_dl, desc="Evaluating ...", position=2)):
             # Model forward
-            model_inputs = shard(model_inputs.data)
+            model_inputs = shard(model_inputs)
             metrics = p_eval_step(state.params, model_inputs)
             eval_metrics.append(metrics)
 
