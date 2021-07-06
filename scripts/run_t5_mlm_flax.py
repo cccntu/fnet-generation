@@ -29,7 +29,9 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+import datasets
 from datasets import load_dataset
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 import flax
@@ -55,7 +57,7 @@ from transformers import (
 from transformers.models.t5.modeling_flax_t5 import shift_tokens_right
 import wandb
 
-
+CPU_COUNT = len(os.sched_getaffinity(0))
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
@@ -208,9 +210,17 @@ def compute_input_and_target_lengths(inputs_length, noise_density, mean_noise_sp
         targets_length -= 1
     return tokens_length, targets_length
 
-
-@flax.struct.dataclass
+#@flax.struct.dataclass
+@dataclass
 class FlaxDataCollatorForT5MLM:
+    def __call__(self, examples):
+        ret = {k: np.concatenate([ex[k] for ex in examples]) for k in examples[0].keys()}
+        return ret
+        
+
+#@flax.struct.dataclass
+@dataclass
+class FlaxDatasetForT5MLM:
     """
     Data collator used for T5 span-masked language modeling.
     It is made sure that after masking the inputs are of length `data_args.max_seq_length` and targets are also of fixed length.
@@ -242,12 +252,19 @@ class FlaxDataCollatorForT5MLM:
     target_length: int
     pad_token_id: int
     decoder_start_token_id: int
+    dataset: datasets.Dataset
+    def __len__(self):
+        return len(self.dataset)
+    def __getitem__(self, i):
+        example = self.dataset[i]
+        processed = self([example])
+        return processed
 
     def __call__(self, examples: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
 
         # convert list to dict and tensorize input
-        batch = BatchEncoding(
-            {k: np.array([examples[i][k] for i in range(len(examples))]) for k, v in examples[0].items()}
+        batch = (
+            {k: np.array([ex[k] for ex in examples]) for k in examples[0].keys()}
         )
 
         input_ids = batch["input_ids"]
@@ -360,7 +377,13 @@ class FlaxDataCollatorForT5MLM:
             np.random.shuffle(mask_indices)
             first_in_segment = np.pad(mask_indices, [[1, 0]])
             segment_id = np.cumsum(first_in_segment)
-            segment_length = np.asarray(jax.ops.segment_sum(np.ones_like(segment_id), segment_id))
+            #segment_sum = jax.jit(jax.ops.segment_sum,device =jax.devices('cpu')[0])
+            segment_sum = jax.ops.segment_sum
+            from collections import Counter
+            cnt = Counter(segment_id.tolist())
+            segment_length = np.array([cnt[x] for x in sorted(cnt.keys())])
+
+            #segment_length = np.asarray(segment_sum(np.ones_like(segment_id), segment_id))
             return segment_length
 
         noise_span_lengths = _random_segmentation(num_noise_tokens, num_noise_spans)
@@ -378,15 +401,16 @@ class FlaxDataCollatorForT5MLM:
         return is_noise[:orig_length]
 
 
-def generate_batch_splits(samples_idx: jnp.ndarray, batch_size: int) -> jnp.ndarray:
+def generate_batch_splits(samples_idx:np.ndarray, batch_size: int) -> np.ndarray:
+    """ 
+    for large dataset, use np.ndarray to save device memory
+    """
     num_samples = len(samples_idx)
-    samples_to_remove = num_samples % batch_size
-
-    if samples_to_remove != 0:
-        samples_idx = samples_idx[:-samples_to_remove]
-    sections_split = num_samples // batch_size
-    batch_idx = np.split(samples_idx, sections_split)
-    return batch_idx
+    num_batches = num_samples // batch_size
+    samples_idx = samples_idx[:num_batches*batch_size]
+    return np.split(samples_idx, num_batches)
+    # returning generator will make length inaccessible
+    #return (samples_idx[i*batch_size:(i+1)*batch_size] for i in range(num_batches))
 
 
 def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
@@ -597,30 +621,41 @@ if __name__ == "__main__":
             "Please run pip install tensorboard to enable."
         )
 
-    # Initialize our training
-    rng = jax.random.PRNGKey(training_args.seed)
-    dropout_rngs = jax.random.split(rng, jax.local_device_count())
-
-    model = FlaxT5ForConditionalGeneration(config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype))
     #dtype = getattr(jnp, model_args.dtype)
     #model.params = jax.tree_map(lambda x: x.astype(dtype), model.params)
 
     # Data collator
     # This one will take care of randomly masking the tokens.
-    data_collator = FlaxDataCollatorForT5MLM(
+    data_collator = FlaxDataCollatorForT5MLM()
+    train_set, val_set  = map(lambda split_name: FlaxDatasetForT5MLM(
         tokenizer=tokenizer,
         noise_density=data_args.mlm_probability,
         mean_noise_span_length=data_args.mean_noise_span_length,
         input_length=max_seq_length,
         target_length=targets_length,
-        pad_token_id=model.config.pad_token_id,
-        decoder_start_token_id=model.config.decoder_start_token_id,
-    )
+        pad_token_id=config.pad_token_id,
+        decoder_start_token_id=config.decoder_start_token_id,
+        dataset=tokenized_datasets[split_name],
+    ), ("train", "validation"))
+
 
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
+
+    # dataloader
+    train_dl = DataLoader(train_set, batch_size=train_batch_size, collate_fn=data_collator, 
+    num_workers=CPU_COUNT,shuffle=True,drop_last=True)
+
+    print(jax.tree_map(lambda x:x.shape, next(iter(train_dl))))
+
+    # Initialize our training
+    rng = jax.random.PRNGKey(training_args.seed)
+    dropout_rngs = jax.random.split(rng, jax.local_device_count())
+
+    model = FlaxT5ForConditionalGeneration(config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype))
+
 
     num_train_steps = len(tokenized_datasets["train"]) // train_batch_size * num_epochs
 
@@ -677,7 +712,6 @@ if __name__ == "__main__":
             label_mask = batch.pop("label_mask")
 
             logits = state.apply_fn(**batch, params=params, dropout_rng=dropout_rng, train=True)[0]
-            print(f"{logits.dtype=}")
 
             # compute loss
             loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1]))
@@ -729,26 +763,37 @@ if __name__ == "__main__":
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
 
-    def get_training_steps_generator(rng):
-        epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0) 
-        step = 0
-        for epoch in epochs:
-            # Create sampling rng
-            rng, input_rng = jax.random.split(rng)
-            # Generate an epoch by shuffling sampling indices from the train dataset
-            num_train_samples = len(tokenized_datasets["train"])
-            train_samples_idx = jax.random.permutation(input_rng, jnp.arange(num_train_samples))
-            train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
-            epoch_size = len(train_batch_idx)
-            for i, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
-                samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
-                model_inputs = data_collator(samples)
-                step += 1
-                yield {
-                    'step': step,
-                    'epoch': epoch + i/epoch_size,
-                }, model_inputs
 
+    def jax_random_batch_sampler(rng, num_samples, batch_size):
+        cpu = jax.devices("cpu")[0]
+        rng = jax.device_put(rng, cpu)
+        # loop forever, modify this for epoch-as-unit style. Or control it outside
+        while True:
+            rng, input_rng = jax.random.split(rng)
+            # use cpu key and numpy arange to have all computation on cpu.
+            train_samples_idx = jax.random.permutation(input_rng, np.arange(num_samples))
+            train_samples_idx = np.asarray(train_samples_idx)
+            n_batches = num_samples // batch_size
+            # don't use jnp.split or np.split for faster startup speed.
+            for i in range(n_batches):
+                ids = train_samples_idx[i*batch_size: (i+1)*batch_size].tolist()
+                yield ids
+    def get_training_steps_generator(rng):
+        num_samples = len(tokenized_datasets["train"])
+        batch_size = train_batch_size
+        #batch_sampler = jax_random_batch_sampler(rng, num_samples, batch_size)
+        #train_dl = DataLoader(train_set, batch_size=batch_size, collate_fn=data_collator, num_workers=CPU_COUNT)
+        #train_dl = DataLoader(train_set, batch_sampler=batch_sampler, num_workers=CPU_COUNT, collate_fn=data_collator)
+        step = 0
+        epoch_size = num_samples//batch_size
+        # only loop for fixed number of epoch
+        #epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
+        # for epoch in range(num_epochs):
+        for step, batch in enumerate(tqdm(train_dl)):
+            yield {
+                'step': step+1,
+                'epoch': (step+1)/epoch_size,
+            }, batch
     def evaluate():
         num_eval_samples = len(tokenized_datasets["validation"])
         eval_samples_idx = jnp.arange(num_eval_samples)
@@ -781,7 +826,9 @@ if __name__ == "__main__":
     train_metrics = []
     for info, model_inputs in training_steps_generator:
         # Model forward
-        model_inputs = shard(model_inputs.data)
+        if info['step'] == 1:
+            print(jax.tree_map(lambda x:(type(x), x.shape), model_inputs))
+        model_inputs = shard(model_inputs)
         state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
         train_metric = device_get_one_shard(train_metric)
         train_metrics.append(train_metric)
