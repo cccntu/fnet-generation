@@ -870,7 +870,11 @@ if __name__ == "__main__":
         state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
         train_metric = to_cpu_device(first_shard(train_metric))
         log_buffer.append({'info':info, 'train':train_metric})
-        if info['step'] % training_args.logging_steps == 0:
+
+        do_log = info['step'] % training_args.logging_steps == 0
+        do_eval = info['step'] % training_args.eval_steps == 0
+        do_end = info['step'] == num_train_steps
+        if do_log or do_eval or do_end:
             log_buffer = jax.device_get(log_buffer)
             for log in log_buffer:
                 if jax.process_index() == 0:
@@ -879,7 +883,7 @@ if __name__ == "__main__":
             log_buffer = []
 
         # ======================== Evaluating ==============================
-        if info['step'] % training_args.eval_steps == 0 or info['step'] == num_train_steps:
+        if do_eval or do_end:
             train_time += time.time() - train_start
             eval_metrics = evaluate()
             if jax.process_index() == 0:
