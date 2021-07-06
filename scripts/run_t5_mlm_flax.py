@@ -657,9 +657,13 @@ if __name__ == "__main__":
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
 
     # dataloader
-    # TODO: use jax deterministic random, but we already use np.random in dataset
-    #train_dl = DataLoader(train_set, batch_size=train_batch_size, collate_fn=data_collator, 
-    #num_workers=CPU_COUNT,shuffle=True,drop_last=True, persistent_workers=True)
+    # TODO: use jax deterministic random, we are using np.random in masking and torch random shuffle
+
+    # set different seed for each worker
+    # https://tanelp.github.io/posts/a-bug-that-plagues-thousands-of-open-source-ml-projects/
+    def worker_init_fn(worker_id):
+        np.random.seed(np.random.get_state()[1][0] + worker_id)
+
     train_dl = DataLoader(
         train_set,
         batch_size=train_batch_size,
@@ -668,6 +672,7 @@ if __name__ == "__main__":
         persistent_workers=True,
         drop_last=True,
         collate_fn=collate_fn,
+        worker_init_fn=worker_init_fn,
     )
 
     val_dl = DataLoader(
@@ -678,10 +683,11 @@ if __name__ == "__main__":
         persistent_workers=True,
         drop_last=True,
         collate_fn=collate_fn,
+        worker_init_fn=worker_init_fn,
     )
 
 
-    print(next(iter(train_dl)))
+    #print(next(iter(train_dl)))
     #print(jax.tree_map(lambda x:x.shape, ))
 
     # Initialize our training
