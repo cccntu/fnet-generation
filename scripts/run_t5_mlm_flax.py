@@ -883,7 +883,7 @@ if __name__ == "__main__":
             log_buffer = []
 
         # ======================== Evaluating ==============================
-        if do_eval or do_end:
+        if do_eval:
             train_time += time.time() - train_start
             eval_metrics = evaluate()
             if jax.process_index() == 0:
@@ -892,10 +892,12 @@ if __name__ == "__main__":
                 if has_tensorboard:
                     cur_step = info['step']
                     write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
-                # save checkpoint after each epoch and push checkpoint to the hub
-                params = jax.device_get(jax.tree_map(lambda x: x[0], state.params))
-                model.save_pretrained(training_args.output_dir, params=params, push_to_hub=training_args.push_to_hub)
             train_start = time.time()
             train_metrics = []
-            if info['step'] == num_train_steps:
-                sys.exit()
+        # save checkpoint after each epoch and push checkpoint to the hub
+        if do_eval or do_end:
+            if jax.process_index() == 0:
+                params = jax.device_get(jax.tree_map(lambda x: x[0], state.params))
+                model.save_pretrained(training_args.output_dir, params=params, push_to_hub=training_args.push_to_hub)
+        if do_end:
+            sys.exit()
