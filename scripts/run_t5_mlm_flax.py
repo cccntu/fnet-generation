@@ -27,6 +27,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
+from collections import Counter
 
 import numpy as np
 import datasets
@@ -390,13 +391,8 @@ class FlaxDatasetForT5MLM:
             np.random.shuffle(mask_indices)
             first_in_segment = np.pad(mask_indices, [[1, 0]])
             segment_id = np.cumsum(first_in_segment)
-            #segment_sum = jax.jit(jax.ops.segment_sum,device =jax.devices('cpu')[0])
-            #segment_sum = jax.ops.segment_sum
-            from collections import Counter
             cnt = Counter(segment_id.tolist())
             segment_length = np.array([cnt[x] for x in sorted(cnt.keys())])
-
-            #segment_length = np.asarray(segment_sum(np.ones_like(segment_id), segment_id))
             return segment_length
 
         noise_span_lengths = _random_segmentation(num_noise_tokens, num_noise_spans)
