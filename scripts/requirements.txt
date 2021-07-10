@@ -5,3 +5,7 @@ flax>=0.3.4
 optax>=0.0.8
 wandb
 -e ../transformers
+
+# cnn-dm
+nltk
+rouge_score
