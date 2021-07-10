@@ -10,7 +10,7 @@ python run_summarization_flax.py \
         --per_device_eval_batch_size 16 \
         --overwrite_output_dir \
         --max_source_length 512 --max_target_length 128 \
-				--adafactor --logging_steps=25 --eval_steps=5000 \
+				--adafactor --logging_steps=25 --eval_steps=5000 --sanity_check_steps=100 \
 				--num_train_epochs=100 --max_steps=262144
         #--push_to_hub
      \

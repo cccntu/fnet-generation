@@ -110,6 +110,13 @@ class ModelArguments:
             "help": "Floating-point format in which the model weights should be initialized and trained. Choose one of `[float32, float16, bfloat16]`."
         },
     )
+    sanity_check_steps: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Run evaluation, saving, ... @step = sanity_check_step for testing."
+        },
+    )
+
 
 
 @dataclass
@@ -811,8 +818,9 @@ def main():
         do_log = info['step'] % training_args.logging_steps == 0
         do_eval = info['step'] % training_args.eval_steps == 0
         do_end = info['step'] == num_train_steps
+        do_check = info['step'] == model_args.sanity_check_steps
         # clear log buffer and log
-        if do_log or do_eval or do_end:
+        if do_log or do_eval or do_end or do_check:
             log_buffer = jax.device_get(log_buffer)
             for log in log_buffer:
                 if jax.process_index() == 0:
@@ -821,7 +829,7 @@ def main():
             log_buffer = []
 
         # ======================== Evaluating ==============================
-        if do_eval:
+        if do_eval or do_check:
             train_time += time.time() - train_start
             eval_metrics = evaluate_loop()
             pred_metrics = predict_loop()
@@ -834,7 +842,8 @@ def main():
                     write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
             train_start = time.time()
             train_metrics = []
-        if do_eval or do_end:
+        # ======================== Save ==============================
+        if do_eval or do_end or do_check:
             if jax.process_index() == 0:
                 params = jax.device_get(unreplicate(state.params))
                 model.save_pretrained(
