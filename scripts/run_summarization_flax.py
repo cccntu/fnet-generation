@@ -22,7 +22,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Callable, Optional
@@ -53,7 +53,7 @@ from transformers import (
     is_tensorboard_available,
 )
 from transformers.file_utils import is_offline_mode
-
+import wandb
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,9 @@ except (LookupError, OSError):
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
-
+JAX_CPU = jax.devices("cpu")[0]
+def to_cpu_device(device_array):
+    return jax.device_put(device_array, JAX_CPU) # return DeviceArray, hopefully non-blocking
 @dataclass
 class ModelArguments:
     """
@@ -213,7 +215,6 @@ class DataTrainingArguments:
         if self.val_max_target_length is None:
             self.val_max_target_length = self.max_target_length
 
-
 summarization_name_mapping = {
     "amazon_reviews_multi": ("review_body", "review_title"),
     "big_patent": ("description", "abstract"),
@@ -227,6 +228,17 @@ summarization_name_mapping = {
     "xsum": ("document", "summary"),
     "wiki_summary": ("article", "highlights"),
 }
+
+class LengthedGeneratorWrapper:
+    """wraps a infinite generator with length for tqdm"""
+    def __init__(self, infinite_generator, len):
+        self.generator = infinite_generator
+        self.len = len
+    def __len__(self):
+        return self.len
+    def __iter__(self):
+        for _ in range(self.len):
+            yield next(self.generator)
 
 
 class TrainState(train_state.TrainState):
@@ -253,10 +265,8 @@ def data_loader(rng: jax.random.PRNGKey, dataset: Dataset, batch_size: int, shuf
 
     for idx in batch_idx:
         batch = dataset[idx]
-        batch = {k: jnp.array(v) for k, v in batch.items()}
-
+        batch = {k: np.array(v) for k, v in batch.items()}
         batch = shard(batch)
-
         yield batch
 
 
@@ -274,11 +284,10 @@ def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
 
 
 def create_learning_rate_fn(
-    train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
+    train_ds_size: int, train_batch_size: int, num_train_steps: int, num_warmup_steps: int, learning_rate: float
 ) -> Callable[[int], jnp.array]:
     """Returns a linear warmup, linear_decay learning rate function."""
     steps_per_epoch = train_ds_size // train_batch_size
-    num_train_steps = steps_per_epoch * num_train_epochs
     warmup_fn = optax.linear_schedule(init_value=0.0, end_value=learning_rate, transition_steps=num_warmup_steps)
     decay_fn = optax.linear_schedule(
         init_value=learning_rate, end_value=0, transition_steps=num_train_steps - num_warmup_steps
@@ -563,13 +572,16 @@ def main():
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
     steps_per_epoch = len(train_dataset) // train_batch_size
-    total_train_steps = steps_per_epoch * num_epochs
+    num_train_steps = steps_per_epoch * num_epochs
+    if 0 < training_args.max_steps < num_train_steps:
+        print(f'Will stop at {training_args.max_steps} steps.')
+        num_train_steps = training_args.max_steps
 
     # Create learning rate schedule
     linear_decay_lr_schedule_fn = create_learning_rate_fn(
         len(train_dataset),
         train_batch_size,
-        training_args.num_train_epochs,
+        num_train_steps,
         training_args.warmup_steps,
         training_args.learning_rate,
     )
@@ -588,19 +600,24 @@ def main():
         ]
         flat_mask = {path: (path[-1] != "bias" and path[-2:] not in layer_norm_params) for path in flat_params}
         return traverse_util.unflatten_dict(flat_mask)
-
-    # create adam optimizer
-    adamw = optax.adamw(
-        learning_rate=linear_decay_lr_schedule_fn,
-        b1=training_args.adam_beta1,
-        b2=training_args.adam_beta2,
-        eps=training_args.adam_epsilon,
-        weight_decay=training_args.weight_decay,
-        mask=decay_mask_fn,
-    )
+    # create optimizer
+    if training_args.adafactor:
+        print(f"using adafactor optimizer")
+        tx = optax.adafactor(
+            learning_rate=linear_decay_lr_schedule_fn,
+        )
+    else:
+        tx = optax.adamw(
+            learning_rate=linear_decay_lr_schedule_fn,
+            b1=training_args.adam_beta1,
+            b2=training_args.adam_beta2,
+            eps=training_args.adam_epsilon,
+            weight_decay=training_args.weight_decay,
+            mask=decay_mask_fn,
+        )
 
     # Setup train state
-    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dropout_rng=dropout_rng)
+    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=tx, dropout_rng=dropout_rng)
 
     # label smoothed cross entropy
     def loss_fn(logits, labels, padding_mask, label_smoothing_factor=0.0):
@@ -683,41 +700,28 @@ def main():
     logger.info(f"  Num Epochs = {num_epochs}")
     logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
-    logger.info(f"  Total optimization steps = {total_train_steps}")
+    logger.info(f"  Total optimization steps = {num_train_steps}")
 
     train_time = 0
-    epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
-    for epoch in epochs:
-        # ======================== Training ================================
-        train_start = time.time()
+    def get_training_steps_generator(rng):
+        step = 1
+        while True:
+            rng, input_rng = jax.random.split(rng)
+            train_loader = data_loader(input_rng, train_dataset, train_batch_size, shuffle=True)
+            for batch in train_loader:
+                yield {
+                    'step': step,
+                    'epoch': step/steps_per_epoch,
+                }, batch
+                step += 1
 
-        # Create sampling rng
-        rng, input_rng = jax.random.split(rng)
-        train_metrics = []
-
-        # Generate an epoch by shuffling sampling indices from the train dataset
-        train_loader = data_loader(input_rng, train_dataset, train_batch_size, shuffle=True)
-        steps_per_epoch = len(train_dataset) // train_batch_size
-        # train
-        for _ in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
-            batch = next(train_loader)
-            state, train_metric = p_train_step(state, batch)
-            train_metrics.append(train_metric)
-
-        train_time += time.time() - train_start
-
-        train_metric = unreplicate(train_metric)
-
-        epochs.write(
-            f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate: {train_metric['learning_rate']})"
-        )
-
+    def evaluate_loop():
         # ======================== Evaluating ==============================
         eval_metrics = []
         eval_preds = []
         eval_labels = []
 
-        eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size)
+        eval_loader = data_loader(None, eval_dataset, eval_batch_size)
         eval_steps = len(eval_dataset) // eval_batch_size
         for _ in tqdm(range(eval_steps), desc="Evaluating...", position=2, leave=False):
             # Model forward
@@ -743,26 +747,17 @@ def main():
             rouge_metrics = compute_metrics(eval_preds, eval_labels)
             eval_metrics.update(rouge_metrics)
             rouge_desc = " ".join([f"Eval {key}: {value} |" for key, value in rouge_metrics.items()])
+        return eval_metrics
 
-        # Print metrics and update progress bar
-        desc = f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {eval_metrics['loss']} | {rouge_desc})"
-        epochs.write(desc)
-        epochs.desc = desc
 
-        # Save metrics
-        if has_tensorboard and jax.process_index() == 0:
-            cur_step = epoch * (len(train_dataset) // train_batch_size)
-            write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
-
-    # ======================== Prediction loop ==============================
-    if training_args.do_predict:
+    def predict_loop():
         logger.info("*** Predict ***")
 
         pred_metrics = []
         pred_generations = []
         pred_labels = []
 
-        pred_loader = data_loader(input_rng, predict_dataset, eval_batch_size)
+        pred_loader = data_loader(None, predict_dataset, eval_batch_size)
         pred_steps = len(predict_dataset) // eval_batch_size
         for _ in tqdm(range(pred_steps), desc="Predicting...", position=2, leave=False):
             # Model forward
@@ -792,17 +787,64 @@ def main():
         # Print metrics
         desc = f"Predict Loss: {pred_metrics['loss']} | {rouge_desc})"
         logger.info(desc)
+        return pred_metrics
+    wandb.init(project='fnet-generation', config={'model_args':asdict(model_args),
+        'data_args':asdict(data_args),
+        'training_args':asdict(training_args)})
 
-        # save checkpoint after each epoch and push checkpoint to the hub
-        if jax.process_index() == 0:
-            params = jax.device_get(jax.tree_map(lambda x: x[0], state.params))
-            model.save_pretrained(
-                training_args.output_dir,
-                params=params,
-                push_to_hub=training_args.push_to_hub,
-                commit_message=f"Saving weights and logs of epoch {epoch+1}",
-            )
 
+    training_steps_generator = get_training_steps_generator(rng)
+    training_steps_generator = LengthedGeneratorWrapper(training_steps_generator, len=num_train_steps)
+    train_start = time.time()
+    train_time=0
+    train_metrics = []
+    log_buffer = [] # don't log every step
+    for info, batch in tqdm(training_steps_generator):
+        # Model forward
+        if info['step'] == 1:
+            print('first step:')
+            print(jax.tree_map(lambda x:(type(x), x.shape), batch))
+        state, train_metric = p_train_step(state, batch)
+        train_metric = to_cpu_device(unreplicate(train_metric))
+        log_buffer.append({'info':info, 'train':train_metric})
+
+        do_log = info['step'] % training_args.logging_steps == 0
+        do_eval = info['step'] % training_args.eval_steps == 0
+        do_end = info['step'] == num_train_steps
+        # clear log buffer and log
+        if do_log or do_eval or do_end:
+            log_buffer = jax.device_get(log_buffer)
+            for log in log_buffer:
+                if jax.process_index() == 0:
+                    wandb.log(log)
+                    train_metrics.append(log['train'])
+            log_buffer = []
+
+        # ======================== Evaluating ==============================
+        if do_eval:
+            train_time += time.time() - train_start
+            eval_metrics = evaluate_loop()
+            pred_metrics = predict_loop()
+            if jax.process_index() == 0:
+                wandb.log({'info':info, 'eval':jax.device_get(eval_metrics),
+                'test':jax.device_get(pred_metrics)})
+                # Save metrics
+                if has_tensorboard:
+                    cur_step = info['step']
+                    write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
+            train_start = time.time()
+            train_metrics = []
+        if do_eval or do_end:
+            if jax.process_index() == 0:
+                params = jax.device_get(unreplicate(state.params))
+                model.save_pretrained(
+                    training_args.output_dir,
+                    params=params,
+                    push_to_hub=training_args.push_to_hub,
+                    commit_message=f"Saving weights and logs @ {info['step']} step, {info['epoch']} epoch",
+                )
+        if do_end:
+            break
 
 if __name__ == "__main__":
     main()
