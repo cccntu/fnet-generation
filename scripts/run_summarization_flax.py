@@ -585,13 +585,16 @@ def main():
         num_train_steps = training_args.max_steps
 
     # Create learning rate schedule
-    linear_decay_lr_schedule_fn = create_learning_rate_fn(
+    lr_schedule_fn = optax.constant_schedule(training_args.learning_rate)
+    """
+    create_learning_rate_fn(
         len(train_dataset),
         train_batch_size,
         num_train_steps,
         training_args.warmup_steps,
         training_args.learning_rate,
     )
+    """
 
     # We use Optax's "masking" functionality to not apply weight decay
     # to bias and LayerNorm scale parameters. decay_mask_fn returns a
@@ -611,11 +614,11 @@ def main():
     if training_args.adafactor:
         print(f"using adafactor optimizer")
         tx = optax.adafactor(
-            learning_rate=linear_decay_lr_schedule_fn,
+            learning_rate=lr_schedule_fn,
         )
     else:
         tx = optax.adamw(
-            learning_rate=linear_decay_lr_schedule_fn,
+            learning_rate=lr_schedule_fn,
             b1=training_args.adam_beta1,
             b2=training_args.adam_beta2,
             eps=training_args.adam_epsilon,
@@ -664,7 +667,7 @@ def main():
 
         new_state = state.apply_gradients(grads=grad, dropout_rng=new_dropout_rng)
 
-        metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
+        metrics = {"loss": loss, "learning_rate": lr_schedule_fn(state.step)}
         metrics = jax.lax.pmean(metrics, axis_name="batch")
 
         return new_state, metrics
