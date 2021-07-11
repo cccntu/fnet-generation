@@ -48,6 +48,7 @@ from transformers import (
     AutoConfig,
     AutoTokenizer,
     FlaxAutoModelForSeq2SeqLM,
+    T5TokenizerFast,
     HfArgumentParser,
     TrainingArguments,
     is_tensorboard_available,
@@ -116,6 +117,10 @@ class ModelArguments:
             "help": "Run evaluation, saving, ... @step = sanity_check_step for testing."
         },
     )
+    use_ft5: bool = field(
+        default=False,
+        metadata={"help": "Whether to use fnet-t5-hybrid model"},
+    ) 
 
 
 
@@ -315,6 +320,12 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if model_args.use_ft5:
+        from transformers.models.f_t5.modeling_flax_t5 import FlaxT5ForConditionalGeneration
+        from transformers.models.f_t5.configuration_t5 import T5Config
+    else:
+        from transformers import T5Config, FlaxT5ForConditionalGeneration 
+
 
     if (
         os.path.exists(training_args.output_dir)
@@ -375,19 +386,19 @@ def main():
     # Load pretrained model and tokenizer
 
     if model_args.config_name:
-        config = AutoConfig.from_pretrained(model_args.config_name, cache_dir=model_args.cache_dir)
+        config = T5Config.from_pretrained(model_args.config_name, cache_dir=model_args.cache_dir)
     elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, cache_dir=model_args.cache_dir)
+        config = T5Config.from_pretrained(model_args.model_name_or_path, cache_dir=model_args.cache_dir)
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
     if model_args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = T5TokenizerFast.from_pretrained(
             model_args.tokenizer_name, cache_dir=model_args.cache_dir, use_fast=model_args.use_fast_tokenizer
         )
     elif model_args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = T5TokenizerFast.from_pretrained(
             model_args.model_name_or_path, cache_dir=model_args.cache_dir, use_fast=model_args.use_fast_tokenizer
         )
     else:
@@ -397,13 +408,14 @@ def main():
         )
 
     if model_args.model_name_or_path:
-        model = FlaxAutoModelForSeq2SeqLM.from_pretrained(
+        model = FlaxT5ForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path, config=config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype)
         )
     else:
-        model = FlaxAutoModelForSeq2SeqLM.from_config(
+        model = FlaxT5ForConditionalGeneration.from_config(
             config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype)
         )
+    print(type(model))
 
     if model.config.decoder_start_token_id is None:
         raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
@@ -827,6 +839,8 @@ def main():
             log_buffer = jax.device_get(log_buffer)
             for log in log_buffer:
                 if jax.process_index() == 0:
+                    if np.isnan(log['train']['loss']):
+                        log['train']['loss'] = -1
                     wandb.log(log)
                     train_metrics.append(log['train'])
             log_buffer = []

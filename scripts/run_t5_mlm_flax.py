@@ -20,6 +20,7 @@ Here is the full list of checkpoints on the hub that can be pretrained by this s
 https://huggingface.co/models?filter=t5
 """
 # You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
+import pprint
 import logging
 import os
 import sys
@@ -46,10 +47,8 @@ from transformers import (
     CONFIG_MAPPING,
     FLAX_MODEL_FOR_MASKED_LM_MAPPING,
     BatchEncoding,
-    FlaxT5ForConditionalGeneration,
     HfArgumentParser,
     PreTrainedTokenizerBase,
-    T5Config,
     T5TokenizerFast,
     TrainingArguments,
     is_tensorboard_available,
@@ -112,6 +111,10 @@ class ModelArguments:
             "help": "Floating-point format in which the model weights should be initialized and trained. Choose one of `[float32, float16, bfloat16]`."
         },
     )
+    use_ft5: bool = field(
+        default=False,
+        metadata={"help": "Whether to use fnet-t5-hybrid model"},
+    ) 
 
 
 @dataclass
@@ -453,6 +456,12 @@ if __name__ == "__main__":
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if model_args.use_ft5:
+        from transformers.models.f_t5.modeling_flax_t5 import FlaxT5ForConditionalGeneration
+        from transformers.models.f_t5.configuration_t5 import T5Config
+    else:
+        from transformers import T5Config, FlaxT5ForConditionalGeneration
+
 
     if (
         os.path.exists(training_args.output_dir)
@@ -692,6 +701,7 @@ if __name__ == "__main__":
     dropout_rngs = jax.random.split(rng, jax.local_device_count())
 
     model = FlaxT5ForConditionalGeneration(config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype))
+    pprint.pprint(jax.tree_map(lambda x: x.shape, model.params))
 
 
     epoch_size = len(tokenized_datasets["train"]) // train_batch_size
